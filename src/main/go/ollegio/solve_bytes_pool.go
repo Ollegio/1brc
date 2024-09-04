@@ -4,13 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"hash/fnv"
 	"hash/maphash"
 	"io"
 	"log/slog"
 	"slices"
 	"sync"
-	"unsafe"
 
 	"golang.org/x/exp/maps"
 )
@@ -21,71 +19,48 @@ type istats struct {
 }
 
 type hashstats struct {
-	// hash  uint64
-	key   string
-	stats *istats
+	key           string
+	min, max, sum int
+	cnt           int
 }
 
 type myhashmap struct {
-	buf  []*hashstats
+	buf  []hashstats
 	seed maphash.Seed
 }
 
 func NewHashMap() *myhashmap {
 	return &myhashmap{
-		buf:  make([]*hashstats, 1<<16),
+		buf:  make([]hashstats, 1<<16),
 		seed: maphash.MakeSeed(),
 	}
 }
 
-func bytes2str(b []byte) string {
-	return unsafe.String(&b[0], len(b))
-}
-
-func hash(data []byte) uint64 {
-	var hash uint64 = 14695981039346656037
-	ptr := unsafe.Pointer(unsafe.SliceData(data))
-	i := 0
-	for ; i < len(data)>>2; i++ {
-		// hash ^= uint64(data[i]) + uint64(data[i+1])<<8 + uint64(data[i+2])<<16 + uint64(data[i+3])<<24
-		hash ^= uint64(*(*uint32)(unsafe.Add(ptr, i<<2)))
-		hash *= 1099511628211
-	}
-	rem := uint64(*(*uint32)(unsafe.Add(ptr, i<<2)))
-	rem >>= 32 - (len(data)&3)*8
-	hash ^= uint64(rem)
-	hash *= 1099511628211
-
-	return hash
-}
-
-func (h *myhashmap) getOrCreate(key []byte) (*istats, bool) {
-	var existing *hashstats
-
-	hash := fnv.New64a()
-	hash.Write(key)
-	idx := hash.Sum64() & uint64(len(h.buf)-1)
+func (h *myhashmap) update(key []byte, temp int) {
+	hash := maphash.Bytes(h.seed, key)
+	idx := hash & uint64(len(h.buf)-1)
 	for {
-		existing = h.buf[idx]
+		if h.buf[idx].key == "" {
+			h.buf[idx].key = string(key)
 
-		if existing == nil {
-			existing = &hashstats{
-				// hash:  hash,
-				key:   string(key),
-				stats: &istats{},
-			}
-			h.buf[idx] = existing
+			h.buf[idx].min = temp
+			h.buf[idx].max = temp
+			h.buf[idx].cnt = 1
 
-			return existing.stats, false
+			return
 		}
 
-		if bytes2str(key) != existing.key {
+		if string(key) != h.buf[idx].key {
 			idx++
 			idx &= uint64(len(h.buf) - 1)
 			continue
 		}
 
-		return existing.stats, true
+		h.buf[idx].cnt++
+		h.buf[idx].min = min(h.buf[idx].min, temp)
+		h.buf[idx].max = max(h.buf[idx].max, temp)
+		h.buf[idx].sum = h.buf[idx].sum + temp
+		return
 	}
 }
 
@@ -96,8 +71,7 @@ func solveBytesPool(input io.Reader, output io.Writer) {
 
 	numThreads := 12
 
-	// resultCh := make(chan map[string]*istats, numThreads)
-	resultCh := make(chan *myhashmap, numThreads)
+	resultCh := make([]*myhashmap, numThreads)
 
 	lineCh := make(chan []byte, 100)
 	pool := sync.Pool{
@@ -107,12 +81,14 @@ func solveBytesPool(input io.Reader, output io.Writer) {
 		},
 	}
 
-	result := map[string]*istats{}
+	result := map[string]istats{}
 
 	wg := sync.WaitGroup{}
 	wg.Add(numThreads)
 	for i := 0; i < numThreads; i++ {
 		go func() {
+			defer wg.Done()
+
 			result := NewHashMap()
 
 			for lines := range lineCh {
@@ -144,23 +120,13 @@ func solveBytesPool(input io.Reader, output io.Writer) {
 					}
 					temp := itemp * sign
 
-					s, ok := result.getOrCreate(first)
-					if !ok {
-						s.min = temp
-						s.max = temp
-					}
-					s.cnt++
-					s.min = min(s.min, temp)
-					s.max = max(s.max, temp)
-					s.sum = s.sum + temp
+					result.update(first, temp)
 				}
 
 				pool.Put(&lines)
 			}
 
-			resultCh <- result
-
-			wg.Done()
+			resultCh[i] = result
 		}()
 	}
 
@@ -183,24 +149,23 @@ func solveBytesPool(input io.Reader, output io.Writer) {
 
 	close(lineCh)
 	wg.Wait()
-	close(resultCh)
 
-	for m := range resultCh {
+	for _, m := range resultCh {
 		for _, v := range m.buf {
-			if v == nil {
+			if v.key == "" {
 				continue
 			}
 			s, ok := result[v.key]
 			if !ok {
-				s = &istats{
-					min: v.stats.min,
-					max: v.stats.max,
+				s = istats{
+					min: v.min,
+					max: v.max,
 				}
 			}
-			s.cnt += v.stats.cnt
-			s.min = min(s.min, v.stats.min)
-			s.max = max(s.max, v.stats.max)
-			s.sum = s.sum + v.stats.sum
+			s.cnt += v.cnt
+			s.min = min(s.min, v.min)
+			s.max = max(s.max, v.max)
+			s.sum = s.sum + v.sum
 			result[v.key] = s
 		}
 	}
